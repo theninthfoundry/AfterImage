@@ -1,11 +1,14 @@
 """Incident agent: observe > recall > reason > investigate > decide > verify > reflect > remember.
-Memory changes the investigation order. Nothing is reported as saved unless Hindsight accepted the write."""
+Memory changes the investigation order. Nothing is reported as saved unless Hindsight accepted the write.
+Each incident carries its own hypothesis set and priors (see app/sim.py) — memory only ever adjusts
+scores for hypotheses that belong to the current incident, so a recalled fact from an unrelated
+incident family can influence relevance filtering but never invents a hypothesis that isn't there.
+"""
 import time
 from . import sim, llm
 from .memory import MemoryOffline
 
 LABEL = {"confirmed": "confirmed", "false": "ruled out", "partial": "partly true"}
-WEIGHT = {"confirmed": 60, "false": -40, "partial": -10}
 
 
 def jaccard(a, b):
@@ -20,7 +23,7 @@ def recall_context(mem, inc):
         hyp, res, how = m.meta.get("hypothesis"), m.meta.get("result"), "metadata"
         if not hyp:  # fallback if Hindsight returned the fact without our metadata
             t, how = m.text.lower(), "text"
-            hyp = next((h for h in sim.PRIOR if h in t), None)
+            hyp = next((h for h in inc["hyp"] if h in t), None)
             res = "false" if hyp and any(w in t for w in ("ruled out", "not the cause", "disproven")) else "confirmed" if hyp and any(w in t for w in ("root cause", "confirmed")) else None
         sig = [s for s in m.meta.get("signals", "").split(",") if s]
         rel = jaccard(inc["signals"], sig) if sig else None
@@ -31,11 +34,11 @@ def recall_context(mem, inc):
     return out
 
 
-def rank(recalled):
-    sc, adj = dict(sim.PRIOR), {}
+def rank(inc, recalled):
+    sc, adj = dict(inc["prior"]), {}
     for r in recalled:
-        if r["hyp"] in sc and r["result"] in WEIGHT:
-            sc[r["hyp"]] += WEIGHT[r["result"]] * (r["relevance"] if r["relevance"] is not None else 0.5)
+        if r["hyp"] in sc and r["result"] in sim.WEIGHT:
+            sc[r["hyp"]] += sim.WEIGHT[r["result"]] * (r["relevance"] if r["relevance"] is not None else 0.5)
             adj.setdefault(r["hyp"], []).append(r["id"])
     return sorted(sc, key=lambda h: -sc[h]), sc, adj
 
@@ -51,13 +54,14 @@ def candidates(inc, tested, prior, lesson_text):
     c.append(dict(imp=.85, doc="resolution", text=f"{inc['fix']} restored {inc['service']} in {inc['recovery_s']}s (simulated).", meta={**base, "kind": "resolution"}))
     if prior >= 1:
         c.append(dict(imp=.9, doc="pattern", text=lesson_text,
-                      meta={**base, "kind": "pattern", "hypothesis": inc["root"], "result": "confirmed", "signals": ",".join(sim.PATTERN_SIGNALS)}))
+                      meta={**base, "kind": "pattern", "hypothesis": inc["root"], "result": "confirmed", "signals": ",".join(inc["signals"])}))
     c += [dict(imp=.1, doc="noise-1", text="routine CPU and traffic samples", meta={}), dict(imp=.1, doc="noise-2", text="duplicate 5xx log lines", meta={})]
     return c
 
 
 def make_lesson(inc, tested, prior, use_llm):
-    draft = f"Pattern from {prior + 1} incidents: recent deploy + DB saturation + latency points to {inc['root']}; ruled out each time: {', '.join(t['h'] for t in tested if t['res'] == 'false') or 'none'}."
+    ruled_out = ", ".join(t["h"] for t in tested if t["res"] == "false") or "none"
+    draft = f"Pattern from {prior + 1} incidents on services like {inc['service']}: {', '.join(inc['signals'][1:3])} points to {inc['root']}; ruled out each time: {ruled_out}."
     if not use_llm:
         return draft, "templated lesson (LLM off)"
     try:
@@ -87,24 +91,24 @@ def run_incident(inc, mem=None, use_llm=True):
         except MemoryOffline as e:
             status = "offline"
             S.add("recall", "Memory engine offline.", str(e), ok=False)
-    order, _, adj = rank(recalled)
-    base = sorted(sim.PRIOR, key=lambda h: -sim.PRIOR[h])
+    order, _, adj = rank(inc, recalled)
+    base = sorted(inc["prior"], key=lambda h: -inc["prior"][h])
     if adj:
         S.add("reason", "Hypotheses re-ranked.", "moved by memory: " + ", ".join(adj))
     tested, sec = [], 6
     for h in order:
-        s, res, why = sim.HYP[h]
-        sec += s
-        tested.append(dict(h=h, res=res, why=why, sec=s))
-        S.add("investigate", f"{h}: {LABEL[res]}.", why)
-        if res == "confirmed":
+        hh = inc["hyp"][h]
+        sec += hh["sec"]
+        tested.append(dict(h=h, res=hh["result"], why=hh["why"], sec=hh["sec"]))
+        S.add("investigate", f"{h}: {LABEL[hh['result']]}.", hh["why"])
+        if hh["result"] == "confirmed":
             break
     S.add("decide", inc["cause"][0].upper() + inc["cause"][1:] + ".", f"root cause: {inc['root']}; action: {inc['fix']}")
     S.add("verify", f"{inc['fix']} · {inc['recovery_s']}s", "simulated recovery")
-    prior = sum(1 for r in recalled if r["kind"] == "incident" and r["hyp"] == inc["root"] and r["result"] == "confirmed")
-    lesson_text, how = make_lesson(inc, tested, prior, use_llm)
+    prior_confirmations = sum(1 for r in recalled if r["kind"] == "incident" and r["hyp"] == inc["root"] and r["result"] == "confirmed")
+    lesson_text, how = make_lesson(inc, tested, prior_confirmations, use_llm)
     S.add("reflect", "Deciding what to keep.", how)
-    cands = candidates(inc, tested, prior, lesson_text)
+    cands = candidates(inc, tested, prior_confirmations, lesson_text)
     kept = [c for c in cands if c["imp"] >= .5]
     written = 0
     if status == "online":
@@ -118,6 +122,7 @@ def run_incident(inc, mem=None, use_llm=True):
             S.add("remember", "Not saved: memory engine offline.", str(e), ok=False)
     else:
         S.add("remember", "Memory disabled (baseline)." if mem is None else "Not saved: memory engine offline.", "", ok=mem is None)
-    return dict(inc={k: inc[k] for k in ("id", "service", "severity", "metrics", "simulated")}, root=inc["root"], steps=list(S), recalled=recalled,
+    return dict(inc={k: inc[k] for k in ("id", "service", "severity", "metrics", "simulated")}, root=inc["root"],
+                fix=inc["fix"], recovery_s=inc["recovery_s"], steps=list(S), recalled=recalled,
                 order=order, base_order=base, tested=tested, sec=sec, wrong=sum(t["res"] != "confirmed" for t in tested),
                 memory=dict(status=status, written=written, dropped=len(cands) - len(kept)))
