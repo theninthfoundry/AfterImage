@@ -1,0 +1,28 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: afterimage
+      POSTGRES_PASSWORD: afterimage
+      POSTGRES_DB: afterimage
+    volumes:
+      - afterimage-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U afterimage"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://afterimage:afterimage@db:5432/afterimage
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  afterimage-db:
