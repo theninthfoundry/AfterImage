@@ -1,4 +1,4 @@
-from app import agent, sim
+from app import agent, db, sim
 from app.memory import Mem, MemoryOffline
 
 I = sim.INCIDENTS
@@ -64,9 +64,53 @@ def test_pattern_generalises_to_other_service():
     assert agent.run_incident(I[3], m, use_llm=False)["order"][0] == "deployment regression"
 
 
+def test_unrelated_incident_not_influenced_by_memory():
+    """INC-004 (redis/auth-service) shares no signals with INC-001 (payment-api deploy regression).
+    Memory from one must not leak into the other's ranking or relevance list."""
+    m = Fake()
+    agent.run_incident(I[1], m, use_llm=False)
+    r4 = agent.run_incident(I[4], m, use_llm=False)
+    assert r4["order"] == r4["base_order"]
+    assert all(rec["hyp"] not in ("deployment regression",) for rec in r4["recalled"])
+
+
+def test_all_five_scenarios_resolve_to_their_own_root_cause():
+    for n, inc in I.items():
+        r = agent.run_incident(inc, None, use_llm=False)
+        assert r["tested"][-1]["h"] == inc["root"] and r["tested"][-1]["res"] == "confirmed"
+
+
 def test_health_reports_offline_when_hindsight_unreachable(monkeypatch):
     monkeypatch.setenv("HINDSIGHT_URL", "http://127.0.0.1:9")
     from fastapi.testclient import TestClient
     from app import main
     main._mem = None
     assert TestClient(main.app).get("/api/health").json()["memory"] == "offline"
+
+
+def test_db_records_run_with_stages(tmp_path):
+    db.configure(f"sqlite:///{tmp_path/'t1.db'}")
+    s = db.session()
+    try:
+        r = agent.run_incident(I[1], None, use_llm=False)
+        run_id = db.record_run(s, r)
+        rows = db.list_runs(s)
+        assert rows[0].id == run_id
+        assert rows[0].incident_ref == "INC-001" and rows[0].wrong == 3
+        assert len(rows[0].stages) == len(r["steps"]) > 0
+    finally:
+        s.close()
+
+
+def test_graph_links_incidents_sharing_root_cause(tmp_path):
+    db.configure(f"sqlite:///{tmp_path/'t2.db'}")
+    s = db.session()
+    try:
+        for i in (1, 2):
+            db.record_run(s, agent.run_incident(I[i], None, use_llm=False))
+        g = db.build_graph(s)
+        assert any(e["rel"] == "similar_to" for e in g["edges"])
+        kinds = {n["kind"] for n in g["nodes"]}
+        assert {"incident", "service", "root_cause", "resolution"} <= kinds
+    finally:
+        s.close()
